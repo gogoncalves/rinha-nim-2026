@@ -1,0 +1,12 @@
+*.o
+*.bin
+build/
+src/lb
+src/server
+src/lb.dSYM/
+src/server.dSYM/
+tools/build_index
+tools/build_index.dSYM/
+nimcache/
+docker-compose.override.yml
+test/
