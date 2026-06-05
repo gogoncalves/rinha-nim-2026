@@ -8,7 +8,8 @@ WORKDIR /src
 COPY tools ./tools
 
 ARG NIMFLAGS="-d:release -d:danger --mm:arc --threads:on --opt:speed --stackTrace:off --lineTrace:off \
-  --passC:-O3 --passC:-march=haswell --passC:-mavx2 --passC:-flto --passL:-flto --passL:-static --passL:-lpthread"
+  --passC:-O3 --passC:-march=haswell --passC:-mavx2 --passC:-flto --passC:-fno-plt --passC:-fno-stack-protector --passC:-fno-semantic-interposition \
+  --passL:-flto --passL:-static --passL:-lpthread"
 
 # Use prebuilt index.bin from build context (extracted from prior image) to avoid
 # rebuilding the index on every change. Falls back to the build step if missing.

@@ -36,24 +36,53 @@ type
   Conn = object
     fd: cint
     inLen: uint32
-    outBuf: string
+    outLen: uint32
     outPos: uint32
+    outPtr: ptr UncheckedArray[char]
     inBuf: array[BUF_SIZE, char]
 
+# Zero-copy pre-baked HTTP responses. Static bytes — `respond` returns
+# a (ptr, len) pair so the hot path never allocates or copies a string.
 const
-  READY = "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 2\r\nconnection: keep-alive\r\n\r\nok"
-  NOT_FOUND = "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: keep-alive\r\n\r\n"
+  READY_S = "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 2\r\nconnection: keep-alive\r\n\r\nok"
+  NOT_FOUND_S = "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: keep-alive\r\n\r\n"
   APPROVED_HDR = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 35\r\nconnection: keep-alive\r\n\r\n"
   DENIED_HDR = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 36\r\nconnection: keep-alive\r\n\r\n"
+  S0 = APPROVED_HDR & "{\"approved\":true,\"fraud_score\":0.0}"
+  S1 = APPROVED_HDR & "{\"approved\":true,\"fraud_score\":0.2}"
+  S2 = APPROVED_HDR & "{\"approved\":true,\"fraud_score\":0.4}"
+  S3 = DENIED_HDR   & "{\"approved\":false,\"fraud_score\":0.6}"
+  S4 = DENIED_HDR   & "{\"approved\":false,\"fraud_score\":0.8}"
+  S5 = DENIED_HDR   & "{\"approved\":false,\"fraud_score\":1.0}"
 
-let SCORES = [
-  APPROVED_HDR & "{\"approved\":true,\"fraud_score\":0.0}",
-  APPROVED_HDR & "{\"approved\":true,\"fraud_score\":0.2}",
-  APPROVED_HDR & "{\"approved\":true,\"fraud_score\":0.4}",
-  DENIED_HDR   & "{\"approved\":false,\"fraud_score\":0.6}",
-  DENIED_HDR   & "{\"approved\":false,\"fraud_score\":0.8}",
-  DENIED_HDR   & "{\"approved\":false,\"fraud_score\":1.0}",
-]
+# Store responses as long-lived heap-allocated buffers with stable addresses.
+# Nim string literals at module scope point at static rodata in C, but using
+# a global var array of cstrings + length table makes the hot path branchless.
+type
+  RespEntry = object
+    p: ptr UncheckedArray[char]
+    n: uint32
+
+var
+  gReady: RespEntry
+  gNotFound: RespEntry
+  gScores: array[6, RespEntry]
+
+proc initResponses() =
+  proc bake(s: string): RespEntry =
+    let n = s.len
+    # Allocate stable memory; never freed.
+    let p = cast[ptr UncheckedArray[char]](alloc(n))
+    copyMem(p, unsafeAddr s[0], n)
+    RespEntry(p: p, n: uint32(n))
+  gReady = bake(READY_S)
+  gNotFound = bake(NOT_FOUND_S)
+  gScores[0] = bake(S0)
+  gScores[1] = bake(S1)
+  gScores[2] = bake(S2)
+  gScores[3] = bake(S3)
+  gScores[4] = bake(S4)
+  gScores[5] = bake(S5)
 
 
 type
@@ -142,20 +171,20 @@ proc parseReq(buf: ptr UncheckedArray[char], n: int, dst: var Parsed): ParseRes 
   dst.consumed = sep + 4
   return prOk
 
-proc respond(idx: ptr Index, req: Parsed): string =
+proc respond(idx: ptr Index, req: Parsed): RespEntry {.inline.} =
   case req.meth
-  of hmGetReady: return READY
-  of hmOther: return NOT_FOUND
+  of hmGetReady: return gReady
+  of hmOther: return gNotFound
   of hmPostScore:
     var payload: Payload
     try:
       payload = parse(req.body, req.bodyLen)
     except CatchableError:
-      return SCORES[0]
+      return gScores[0]
     let v = vectorize(addr payload)
     let frauds = idx.score(v)
     let i = if frauds > 5'u32: 5 else: int(frauds)
-    return SCORES[i]
+    return gScores[i]
 
 
 type
@@ -211,7 +240,8 @@ proc closeConn(w: var Worker, ci: int) =
     discard posix.close(c.fd)
     c.fd = -1
   c.inLen = 0
-  c.outBuf = ""
+  c.outPtr = nil
+  c.outLen = 0
   c.outPos = 0
   w.freeIdx[w.freeCount] = uint16(ci)
   inc w.freeCount
@@ -225,10 +255,10 @@ proc shiftBuf(c: var Conn, consumed: int) {.inline.} =
   c.inLen = uint32(rem)
 
 proc drainSendNow(c: var Conn): bool =
-  while c.outPos < uint32(c.outBuf.len):
+  while c.outPos < c.outLen:
     let sent = posix.send(SocketHandle(c.fd),
-      addr c.outBuf[int(c.outPos)],
-      int(c.outBuf.len) - int(c.outPos), 0.cint)
+      addr c.outPtr[int(c.outPos)],
+      int(c.outLen) - int(c.outPos), 0.cint)
     if sent <= 0:
       return false
     c.outPos += uint32(sent)
@@ -244,7 +274,8 @@ proc addClientFd(w: var Worker, cfd: cint) =
   let ci = int(w.freeIdx[w.freeCount])
   w.conns[ci].fd = cfd
   w.conns[ci].inLen = 0
-  w.conns[ci].outBuf = ""
+  w.conns[ci].outPtr = nil
+  w.conns[ci].outLen = 0
   w.conns[ci].outPos = 0
   let rc = epollAdd(w, cfd, EVENTS_READ, packTag(hkClient, ci))
   if rc < 0:
@@ -265,7 +296,8 @@ proc addClientFdWithBytes(w: var Worker, cfd: cint, src: ptr uint8, srcLen: int)
   let ci = int(w.freeIdx[w.freeCount])
   let c = addr w.conns[ci]
   c.fd = cfd
-  c.outBuf = ""
+  c.outPtr = nil
+  c.outLen = 0
   c.outPos = 0
   let copyLen = min(srcLen, BUF_SIZE)
   if copyLen > 0:
@@ -293,7 +325,8 @@ proc onRecv(w: var Worker, ci: int) =
       return
     of prOk:
       let resp = respond(w.idx, req)
-      c.outBuf = resp
+      c.outPtr = resp.p
+      c.outLen = resp.n
       c.outPos = 0
       if not drainSendNow(c[]):
         shiftBuf(c[], req.consumed)
@@ -326,7 +359,8 @@ proc onRecv(w: var Worker, ci: int) =
         return
       of prOk:
         let resp = respond(w.idx, req)
-        c.outBuf = resp
+        c.outPtr = resp.p
+        c.outLen = resp.n
         c.outPos = 0
         if not drainSendNow(c[]):
           shiftBuf(c[], req.consumed)
@@ -660,6 +694,8 @@ proc main() =
 
   let nworkersRaw = parseInt(getEnv("API_WORKERS", "1"))
   let nworkers = if nworkersRaw <= 0: 1 else: nworkersRaw
+
+  initResponses()
 
   var idx = index_bin.open(indexPath)
 
