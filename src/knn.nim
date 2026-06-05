@@ -18,12 +18,10 @@ const
   EARLY_DIST*: int64 = EARLY_DIST_QUANT * EARLY_DIST_QUANT * int64(DIMS)
 
 {.compile: "simd.c".}
-{.compile: "tree.c".}
 proc blk_dist_c(vectors: ptr int16, block_idx: csize_t, q: ptr int16, outp: ptr int64) {.importc, cdecl.}
 proc blk_dist_prune_c(vectors: ptr int16, block_idx: csize_t, q: ptr int16, threshold: int64, outp: ptr int64): cint {.importc, cdecl.}
 proc bbox_lb_c(q: ptr int16, mn: ptr int16, mx: ptr int16): int64 {.importc, cdecl.}
 proc blk_prefetch_c(vectors: ptr int16, block_idx: csize_t) {.importc, cdecl.}
-proc tree_predict_safe_c(q: ptr int16): uint8 {.importc, cdecl.}
 
 type
   Probe* = object
@@ -185,13 +183,6 @@ proc repairFull(idx: ptr Index, q: ptr int16, probes: var ProbeArr, probeCount: 
 proc score*(idx: ptr Index, v: array[DIMS, float32]): uint32 =
   var qq = quantize(v)
   let q = cast[ptr int16](addr qq[0])
-
-  # Decision-tree fastpath. Safe leaves return the calibrated fraud count
-  # directly (0..5). Unsafe leaves return 0xFF; fall back to KNN below.
-  # Coverage on test-data.json: ~61% (33200/54100) with 0 FP/FN.
-  let tree_pred = tree_predict_safe_c(q)
-  if tree_pred != 0xFFu8:
-    return uint32(tree_pred)
 
   var probes: ProbeArr
   for i in 0 ..< MAX_PROBES:

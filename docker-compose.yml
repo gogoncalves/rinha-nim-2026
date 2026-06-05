@@ -1,6 +1,6 @@
 services:
   api1:
-    image: gugagoncalves/rinha-2026-nim:v10
+    image: gugagoncalves/rinha-2026-nim:v9
     platform: linux/amd64
     cpuset: "0"
     network_mode: "none"
@@ -24,7 +24,7 @@ services:
           memory: "165MB"
 
   api2:
-    image: gugagoncalves/rinha-2026-nim:v10
+    image: gugagoncalves/rinha-2026-nim:v9
     platform: linux/amd64
     cpuset: "1"
     network_mode: "none"
@@ -48,7 +48,7 @@ services:
           memory: "165MB"
 
   lb:
-    image: gugagoncalves/rinha-2026-nim:v10
+    image: gugagoncalves/rinha-2026-nim:v9
     platform: linux/amd64
     cpuset: "2,3"
     entrypoint: ["/lb"]
