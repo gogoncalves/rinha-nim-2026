@@ -523,6 +523,20 @@ const
 
 proc mlockall_c(flags: cint): cint {.importc: "mlockall", header: "<sys/mman.h>".}
 
+# prctl(PR_SET_TIMERSLACK, 1) — shrink scheduler wake-up jitter from default
+# 50us → 1ns. Best-effort; a process can always tighten its own slack.
+const PR_SET_TIMERSLACK_C = 29.cint
+proc prctl_c(option: cint, arg2: culong, arg3: culong, arg4: culong, arg5: culong): cint
+  {.importc: "prctl", header: "<sys/prctl.h>".}
+
+# sched_setscheduler(SCHED_FIFO, prio) — wake above SCHED_OTHER on IO.
+# Best-effort; needs CAP_SYS_NICE or rtprio ulimit. EPERM ignored.
+const SCHED_FIFO_C = 1.cint
+type SchedParam_c = object
+  sched_priority: cint
+proc sched_setscheduler_c(pid: cint, policy: cint, param: ptr SchedParam_c): cint
+  {.importc: "sched_setscheduler", header: "<sched.h>".}
+
 
 # pthread bindings (musl/glibc compatible).
 type
@@ -697,12 +711,21 @@ proc main() =
 
   initResponses()
 
+  # Best-effort: tighten timer slack to 1ns (default 50us blows the wake-up
+  # budget on a 1.4GHz Haswell). Ignore EPERM/ENOSYS.
+  discard prctl_c(PR_SET_TIMERSLACK_C, 1.culong, 0.culong, 0.culong, 0.culong)
+
+  # Best-effort: promote to SCHED_FIFO so inbound epoll wake preempts
+  # SCHED_OTHER. Needs rtprio ulimit (set in compose). EPERM ignored.
+  var rtparam = SchedParam_c(sched_priority: 10.cint)
+  discard sched_setscheduler_c(0.cint, SCHED_FIFO_C, addr rtparam)
+
   var idx = index_bin.open(indexPath)
 
   # Warmup: bang on the KNN path with pseudo-random vectors so the index pages
   # in, branch predictors and uop caches settle, and the kernel pre-faults the
   # mmaped region before real traffic shows up. Tuneable via WARMUP_MS.
-  let warmupMs = parseInt(getEnv("WARMUP_MS", "800"))
+  let warmupMs = parseInt(getEnv("WARMUP_MS", "5000"))
   if warmupMs > 0:
     let t0 = epochTime()
     var rng: uint64 = 0xDEADBEEFCAFEBABE'u64
