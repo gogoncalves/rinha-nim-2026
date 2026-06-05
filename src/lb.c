@@ -215,6 +215,11 @@ int main(int argc, char **argv) {
 
     uint8_t prefix_buf[MAX_PREFIX];
     int rr = 0;
+    /* Pre-baked /ready response — short-circuited inside the LB so health
+       probes never cross the UDS. Mirrors top-whereisanzi's send_health_ok. */
+    static const char READY_RESPONSE[] =
+        "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok";
+    static const int READY_RESPONSE_LEN = sizeof(READY_RESPONSE) - 1;
     for (;;) {
         int accepted = 0;
         while (accepted < accept_batch) {
@@ -228,6 +233,16 @@ int main(int argc, char **argv) {
             int one = 1;
             setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
             setsockopt(cfd, IPPROTO_TCP, TCP_QUICKACK, &one, sizeof(one));
+
+            /* MSG_PEEK to detect GET /ready before paying the SCM_RIGHTS
+               handoff cost. If the probe matches, reply inline and close. */
+            char peek_buf[64];
+            ssize_t pn = recv(cfd, peek_buf, sizeof(peek_buf), MSG_PEEK | MSG_DONTWAIT);
+            if (pn >= 10 && memcmp(peek_buf, "GET /ready", 10) == 0) {
+                send(cfd, READY_RESPONSE, (size_t)READY_RESPONSE_LEN, MSG_NOSIGNAL);
+                close(cfd);
+                continue;
+            }
 
             int plen = read_prefix(cfd, prefix_buf, MAX_PREFIX);
 
