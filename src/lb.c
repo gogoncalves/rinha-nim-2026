@@ -187,6 +187,15 @@ int main(int argc, char **argv) {
     setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
     setsockopt(lfd, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on));
     setsockopt(lfd, IPPROTO_TCP, TCP_DEFER_ACCEPT, &on, sizeof(on));
+    /* SO_BUSY_POLL: per-socket NAPI busy-poll usecs inside epoll/poll waits.
+       Same value (50us) the top-5 piassa-asm LB uses. Linux ignores it if
+       unsupported; on docker bridge nics it shaves single-digit usecs off
+       p99 by avoiding the softirq schedule on incoming SYN/PSH. */
+#ifndef SO_BUSY_POLL
+#define SO_BUSY_POLL 46
+#endif
+    int busy_poll = 50;
+    setsockopt(lfd, SOL_SOCKET, SO_BUSY_POLL, &busy_poll, sizeof(busy_poll));
 
     struct sockaddr_in addr = {0};
     addr.sin_family = AF_INET;

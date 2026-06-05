@@ -12,8 +12,28 @@
 #if defined(__AVX2__)
 #include <immintrin.h>
 
+static inline int64_t hsum_madd_i64(__m256i d) {
+    __m256i madd = _mm256_madd_epi16(d, d);
+    __m256i lo = _mm256_cvtepi32_epi64(_mm256_castsi256_si128(madd));
+    __m256i hi = _mm256_cvtepi32_epi64(_mm256_extracti128_si256(madd, 1));
+    __m256i sum = _mm256_add_epi64(lo, hi);
+    __m128i sum_lo = _mm256_castsi256_si128(sum);
+    __m128i sum_hi = _mm256_extracti128_si256(sum, 1);
+    __m128i pair = _mm_add_epi64(sum_lo, sum_hi);
+    __m128i pair_hi = _mm_unpackhi_epi64(pair, pair);
+    return _mm_cvtsi128_si64(_mm_add_epi64(pair, pair_hi));
+}
+
 void blk_dist_c(const int16_t* vectors, size_t block_idx, const int16_t* q, int64_t* out) {
     const int16_t* base = vectors + block_idx * BLOCK_WORDS;
+    /* Prefetch the next block so the hot scan loop in Nim has its
+       cache lines primed. Block stride is 256 bytes = 4 cache lines. */
+    const char* next = (const char*)(base + BLOCK_WORDS);
+    _mm_prefetch(next, _MM_HINT_T0);
+    _mm_prefetch(next + 64, _MM_HINT_T0);
+    _mm_prefetch(next + 128, _MM_HINT_T0);
+    _mm_prefetch(next + 192, _MM_HINT_T0);
+
     __m256i acc_lo = _mm256_setzero_si256(); /* 4x i64 */
     __m256i acc_hi = _mm256_setzero_si256();
 
@@ -34,6 +54,14 @@ void blk_dist_c(const int16_t* vectors, size_t block_idx, const int16_t* q, int6
 
 int blk_dist_prune_c(const int16_t* vectors, size_t block_idx, const int16_t* q, int64_t threshold, int64_t* out) {
     const int16_t* base = vectors + block_idx * BLOCK_WORDS;
+    /* Prefetch ahead-1 block (next 256B = 4 lines). Matches bmtec/top-5 strategy
+       of priming the next cluster block while we crunch the current one. */
+    const char* next = (const char*)(base + BLOCK_WORDS);
+    _mm_prefetch(next, _MM_HINT_T0);
+    _mm_prefetch(next + 64, _MM_HINT_T0);
+    _mm_prefetch(next + 128, _MM_HINT_T0);
+    _mm_prefetch(next + 192, _MM_HINT_T0);
+
     __m256i acc_lo = _mm256_setzero_si256();
     __m256i acc_hi = _mm256_setzero_si256();
     __m256i thr = _mm256_set1_epi64x(threshold);
@@ -62,17 +90,33 @@ int blk_dist_prune_c(const int16_t* vectors, size_t block_idx, const int16_t* q,
     return 1;
 }
 
+/* AVX2 branchless lower-bound: PADDED_DIMS=16 fits exactly in one __m256i of int16.
+   Replaces the previous 16-iteration scalar loop. Mirrors bmtec's
+   lower_bound_block_i16 (distance.c:51-65). */
 int64_t bbox_lb_c(const int16_t* q, const int16_t* mn, const int16_t* mx) {
-    int64_t sum = 0;
-    for (int j = 0; j < PADDED_DIMS; ++j) {
-        int32_t g = 0;
-        int32_t below = (int32_t)mn[j] - (int32_t)q[j];
-        int32_t above = (int32_t)q[j] - (int32_t)mx[j];
-        if (below > g) g = below;
-        if (above > g) g = above;
-        sum += (int64_t)g * (int64_t)g;
-    }
-    return sum;
+    __m256i qv = _mm256_loadu_si256((const __m256i*)q);
+    __m256i lo = _mm256_loadu_si256((const __m256i*)mn);
+    __m256i hi = _mm256_loadu_si256((const __m256i*)mx);
+
+    __m256i below = _mm256_cmpgt_epi16(lo, qv);
+    __m256i above = _mm256_cmpgt_epi16(qv, hi);
+    __m256i below_diff = _mm256_sub_epi16(lo, qv);
+    __m256i above_diff = _mm256_sub_epi16(qv, hi);
+    __m256i diff = _mm256_or_si256(
+        _mm256_and_si256(below, below_diff),
+        _mm256_and_si256(above, above_diff)
+    );
+    return hsum_madd_i64(diff);
+}
+
+/* Prefetch one block (256 B = 4 cache lines) at the given index.
+   Exposed to Nim so scanCluster can prime ahead-N blocks. */
+void blk_prefetch_c(const int16_t* vectors, size_t block_idx) {
+    const char* p = (const char*)(vectors + block_idx * BLOCK_WORDS);
+    _mm_prefetch(p, _MM_HINT_T0);
+    _mm_prefetch(p + 64, _MM_HINT_T0);
+    _mm_prefetch(p + 128, _MM_HINT_T0);
+    _mm_prefetch(p + 192, _MM_HINT_T0);
 }
 
 #else
@@ -128,6 +172,11 @@ int64_t bbox_lb_c(const int16_t* q, const int16_t* mn, const int16_t* mx) {
         sum += (int64_t)g * (int64_t)g;
     }
     return sum;
+}
+
+void blk_prefetch_c(const int16_t* vectors, size_t block_idx) {
+    (void)vectors;
+    (void)block_idx;
 }
 
 #endif

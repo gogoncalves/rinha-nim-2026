@@ -21,6 +21,7 @@ const
 proc blk_dist_c(vectors: ptr int16, block_idx: csize_t, q: ptr int16, outp: ptr int64) {.importc, cdecl.}
 proc blk_dist_prune_c(vectors: ptr int16, block_idx: csize_t, q: ptr int16, threshold: int64, outp: ptr int64): cint {.importc, cdecl.}
 proc bbox_lb_c(q: ptr int16, mn: ptr int16, mx: ptr int16): int64 {.importc, cdecl.}
+proc blk_prefetch_c(vectors: ptr int16, block_idx: csize_t) {.importc, cdecl.}
 
 type
   Probe* = object
@@ -104,7 +105,18 @@ proc scanCluster(idx: ptr Index, q: ptr int16, cluster: uint32,
   var dists: array[LANES, int64]
   var blk = startBlk
   var processed: uint32 = 0
+  # Prime ahead-3 blocks for the first 3 iterations so the prefetcher
+  # has 4 blocks (one per cache hint) in flight. blk_dist_prune_c
+  # already prefetches blk+1; we add +2, +3 here.
+  if blk + 2 < endBlk:
+    blk_prefetch_c(cast[ptr int16](addr idx.vectors_base[0]), csize_t(blk + 2))
+  if blk + 3 < endBlk:
+    blk_prefetch_c(cast[ptr int16](addr idx.vectors_base[0]), csize_t(blk + 3))
   while blk < endBlk:
+    # Prefetch ahead-4 every iteration to keep a stable ahead window
+    # while the current block is crunched in the SIMD reduction.
+    if blk + 4 < endBlk:
+      blk_prefetch_c(cast[ptr int16](addr idx.vectors_base[0]), csize_t(blk + 4))
     let threshold = best_d[TOP_K - 1]
     let ok = blk_dist_prune_c(
       cast[ptr int16](addr idx.vectors_base[0]),
